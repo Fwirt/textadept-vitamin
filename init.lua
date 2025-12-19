@@ -1,17 +1,17 @@
 -- Copyright (c) 2025 Fwirt. See LICENSE.
 
 -- vitamin
--- vi textadept mode interface
+-- vi textadept modal interface
 -- Based on the POSIX standard for vi commands:
 -- https://pubs.opengroup.org/onlinepubs/9699919799/utilities/vi.html
 -- Uses a custom event handler to implement a state machine instead
--- of the built-in chain handler because vi commands are nuanced
+-- of the built-in chain handler
 
 -- vi incompatibilites:
 -- - not implemented:
 -- 		[[, ]], ctrl+l, ctrl+r, ctrl+], Q, U, z
 -- - q, ZZ close buffer instead of editor
--- - 0-9 are also allowed as marks
+-- - a, A enter insert mode (same as vim, does not prevent deletion)
 -- - Input mode uses TA keybinds instead of vi keybinds
 --   	i.e. input mode commands that duplicate existing functionality are not implemented
 --   	(ctrl+d, ctrl+h, ctrl+j, ctrl+m, ctrl+u, ctrl+w)
@@ -20,260 +20,162 @@
 -- +TA bookmarks only mark lines so implement character marking
 -- +Implement all the stubbed and commented out functions
 -- +Implement input mode repetition w/ count
+-- +Implement useful vim features (select mode comes to mind)
+-- +Add flag to include style bytes in argument to M.output
+
+local State = require('vitamin.state')
+local Command = require('vitamin.command')
 
 local M = {}
 
--- the keycode to exit input mode
+-- the keycode to exit input mode or cancel current command
 M.escape_keycode = 'esc'
 
+-- the keycode to exit Vitamin mode
+M.exit_mode_keycode = 'ctrl+esc'
+
 -- where to put command output, override this to set different destination.
-M.output = function (text) ui.statusbar_text = text end
+M.output = function (text) ui.statusbar_text = tostring(text) end
 
--- buffer implementation:
--- just a table keyed on character.
--- if the field is a string it's a "character mode" buffer
--- if the field is a table it's a "line mode" buffer
-M.buffers = {}
+-- if true, text argument to M.output will be Scintilla cells instead of plain text
+M.output_include_style = false
 
--- whether or not the event handler is registered
-local registered = false
+-- the current state of the state machine
+local current_state
 
--- little pattern matching functions because
--- string.match is overkill for single chars
-function M.match_alpha(char)
-	local byte = string.byte(char)
-	if (byte >= 97 and byte <= 122) or
-	   (byte >= 65 and byte <= 90)
-			then return true end
-	return false
-end
-
-function M.match_digit(char)
-	local byte = string.byte(char)
-	if (byte >= 48 and byte <= 57) 
-		then return true end
-	return false
-end
-
-function M.match_alphanum(char)
-	local byte = string.byte(char)
-	if (byte >= 97 and byte <= 122) or
-	   (byte >= 65 and byte <= 90) or
-	   (byte >= 48 and byte <= 57)
-			then return true end
-	return false
-end
-
-function M.match_printable(char)
-	local byte = string.byte(char)
-	if byte >= 32 or byte <= 126
-	   or byte == 9 -- tab
-			then return true end
-	return false
-end
-
-function M.to_lower(char)
-	local byte = string.byte(char)
-	if byte >= 65 and byte <= 90
-		then return string.char(byte + 32) end
-	return char
-end
-
---
--- The following is an implementation of a state
--- machine that implements the vi command grammar:
---
--- [buffer][count]command
---
--- buffer := "[0-9a-zA-Z]
--- count := [1-9][0-9]*
--- command := COMMAND args
--- args := EMPTY | mark | char | motion
--- mark := [0-9a-zA-Z]
--- char := CHAR
--- motion = [1-9][0-9]*MOTION[args]
--- COMMAND := keycode in commands table
--- MOTION := keycode in motions table
--- CHAR := printable character (ASCII 37 - 126 or TAB)
--- EMPTY := the empty string
-
-local state = {}
---[[local state.start, state.complete, state.error
-local state.buffer
-local state.count
-local state.command, state.mark, state.char
-local state.motion
-local state.input -- input mode]]
-
-local command -- the current command and all its arguments
-local last_command -- the previous command (for .)
-
-state.start = function (key)
-	command = {}
-	command.buffer = nil
-	command.count = 0
-	command.command = nil
-	command.arg = nil
-	command.motion_count = 0
-	command.motion = nil
-	command.motion_arg = nil
-	command.input_text = {}
-	if #key == 1 then
-		if key == '"' and buffer == nil then
-			return true, state.buffer
-		elseif key ~= 0 and M.match_digit(key) then
-			return state.count(key)
-		end
-	end
-	return state.command(key)
-end
-
-state.buffer = function (key)
-	if #key == 1 and M.match_alphanum(key) then
-		command.buffer = key
-		return true, state.count
-	else
-		return state.error(key)
-	end
-end
-
-state.count = function (key)
-	if #key == 1 and M.match_digit(key) then
-		command.count = command.count * 10 + tonumber(key)
-		return true, state.count
-	else
-		return state.command(key)
-	end
-end
-
-state.command = function (key)
-	local func = M.commands[key]
-	if func == nil then -- undefined function
-		if command.buffer or command.count > 0 then -- invalid
-			return state.error(key)
-		else -- unhandled key, reset and pass to event handlers
-			return false, state.start
-		end
-	else
-		command.command = func
-		if func.state then
-		    return true, func.state
-		else
-			return state.complete(key)
-		end
-	end
-end
-
-state.arg = function (key)
-	if #key == 1 and M.match_alphanum(key) then
-		if command.arg == '' then
-			command.arg = key
-		else
-			command.motion_letter = key
-		end
-		return state.complete(key)
-	else
-		return state.error(key)
-	end
-end
-
--- m ` ' @
-state.mark = function (key)
-	if #key == 1 and M.match_alphanum(key) then
-		if not command.letter then
-			command.arg = key
-		else
-			command.motion_letter = key
-		end
-		return state.complete(key)
-	else
-		return state.error(key)
-	end
-end
-
--- t T f F
-state.char = function (key)
-	if #key == 1 and M.match_printable(key) then
-		command.letter = key
-		return state.complete(key)
-	else
-		return state.error(key)
-	end
-end
-
--- combined count and motion into one state for clarity
-state.motion = function (key)
-	if #key == 1 and M.match_digit(key) then
-		command.motion_count = command.motion_count * 10 + tonumber(key)
-	else
-		local func = motions[key]
-		if func == nil then
-			return state.error(key)
-		else
-			command.motion = func
-			if func.state then
-				return true, func.state
-			else
-				return state.complete(key)
-			end
-		end
-	end
-end
-
--- in input mode, passthrough everything but escape keycode
-state.input = function (key)
-	-- need to install/remove an event handler that catches
-	-- text added to the Scintilla element so we can replay it.
-	if key == M.escape_keycode then
-		return true, state.complete(key)
-	else
-		return false, state.input
-	end
-end
-
--- command is ready for execution
-state.complete = function (key)
-	last_command = command -- for .
-	for i = 1, #command - 1 do
-		command[i](view)
-	end
-	if command.count > 1 then
-		for i = 1, command.count do
-			command[#command](view)
-		end
-	end
-	return true, state.start
-end
-
--- command was improperly formatted
-state.error = function (key)
-	-- return command error here
-	return true, state.start
-end
-
--- Command definition tables below
-
--- Commands that aren't Scintilla native:
+-- ### New Scintilla movement functions ###
 
 -- move without wrapping.
--- vs_no_wrap_line_start would work for left but not right
-function M.char_left_not_line(view) ; end -- h
-function M.char_right_not_line(view) ; end -- l
+-- setting vs_no_wrap_line_start would work for left but not right
+function M.char_left_not_line(view) -- h
+	local line, pos = view:get_cur_line()
+	if pos > 1 then
+		view:char_left()
+	end
+end
+function M.char_right_not_line(view) -- l
+	local line = view:line_from_position(view.current_pos)
+	if view.current_pos < view.line_end_position[line] then
+		view:char_right()
+	end
+end
 
--- move by bigword /.*[/s/n]/
+-- move by bigword /[\s\t\n]+.*[\s\t\n]/
 -- default word definition already matches vi
-function M.bigword_right(view) ; end -- W
-function M.bigword_left(view) ; end -- B
-function M.bigword_right_end(view) ; end -- E
+function M.bigword_right(view) -- W
+	view.search_flags = view.FIND_REGEXP
+	view.target_start = view.current_pos
+	view.target_end = view.length
+	view:search_in_target('[ \t\n]+')
+	view:goto_pos(view.target_end+1)
+end
+function M.bigword_left(view) -- B
+	view.search_flags = view.FIND_REGEXP
+	view.target_start = view.current_pos
+	view.target_end = 0 -- search backwards
+	view:search_in_target('[^ \t\n]*[ \t\n]+')
+	view:goto_pos(view.target_start)
+end
+function M.bigword_right_end(view) -- E
+	view.search_flags = view.FIND_REGEXP
+	view.target_start = view.current_pos
+	view.target_end = view.length
+	view:search_in_target('.[ \t\n]+')
+	view:goto_pos(view.target_start)
+end
+
+-- select by bigword /[\s\t\n]+.*[\s\t\n]/ for motions
+function M.bigword_right_extend(view) -- W
+	view.search_flags = view.FIND_REGEXP
+	view.target_start = view.current_pos
+	view.target_end = view.length
+	view:search_in_target('[ \t\n]+')
+	view.current_pos = view.target_end+1
+end
+function M.bigword_left_extend(view) -- B
+	view.search_flags = view.FIND_REGEXP
+	view.target_start = view.current_pos
+	view.target_end = 0 -- search backwards
+	view:search_in_target('[^ \t\n]*[ \t\n]+')
+	view.current_pos = view.target_start
+end
+function M.bigword_right_end_extend(view) -- E
+	view.search_flags = view.FIND_REGEXP
+	view.target_start = view.current_pos
+	view.target_end = view.length
+	view:search_in_target('.[ \t\n]+')
+	view.current_pos = view.target_start
+end
 
 -- move by sentence /.*[\.\!\?][\)\]\"\']*\s/
-function M.sentence_last(view) ; end -- (
-function M.sentence_next(view) ; end -- )
+function M.sentence_last(view) -- (
+	view.search_flags = view.FIND_REGEXP
+	view.target_start = view.current_pos
+	view.target_end = 0 -- search backwards
+	view:search_in_target('[\\.\\!\\?][\\)\\]\\"\\\']* [^ \t\n]')
+	view:goto_pos(view.target_end+1)
+end
+function M.sentence_next(view) -- )
+	view.search_flags = view.FIND_REGEXP
+	view.target_start = view.current_pos
+	view.target_end = view.length
+	view:search_in_target('[\\.\\!\\?][\\)\\]\\"\\\']* [^ \t\n]')
+	view:goto_pos(view.target_end)
+end
+
+-- select by sentence /.*[\.\!\?][\)\]\"\']*\s/ for motions
+function M.sentence_last_extend(view) -- (
+	view.search_flags = view.FIND_REGEXP
+	view.target_start = view.current_pos
+	view.target_end = 0 -- search backwards
+	view:search_in_target('[\\.\\!\\?][\\)\\]\\"\\\']* [^ \t\n]')
+	view.current_pos = view.target_end+1
+end
+function M.sentence_next_extend(view) -- )
+	view.search_flags = view.FIND_REGEXP
+	view.target_start = view.current_pos
+	view.target_end = view.length
+	view:search_in_target('[\\.\\!\\?][\\)\\]\\"\\\']* [^ \t\n]')
+	view.current_pos = view.target_end
+end
 
 -- move cursor to position in current window
-function M.screen_top(view) ; end -- H
-function M.screen_middle(view) ; end -- M
-function M.screen_bottom(view) ; end -- L
+function M.screen_top(view) -- H
+	view:goto_pos(view:position_from_line(view.first_visible_line))
+end
+function M.screen_middle(view) -- M
+	view:goto_pos(view:position_from_line(
+		view.first_visible_line + view.lines_on_screen // 2
+	))
+end
+function M.screen_bottom(view) -- L
+	view:goto_pos(view:position_from_line(
+		view.first_visible_line + view.lines_on_screen
+	))
+end
+
+-- select to position in current window for motions
+function M.screen_top_extend(view) -- H
+	view.current_pos = view:position_from_line(view.first_visible_line)
+end
+function M.screen_middle_extend(view) -- M
+	view.current_pos = view:position_from_line(
+		view.first_visible_line + view.lines_on_screen // 2
+	)
+end
+function M.screen_bottom_extend(view) -- L
+	view.current_pos = view:position_from_line(
+		view.first_visible_line + view.lines_on_screen
+	)
+end
+
+-- move to next brace position and match
+function M.brace_right_match(view) -- %
+	view.search_flags = view.FIND_REGEXP
+	view.target_start = view.current_pos
+	view.target_end = view.length
+	view:goto_pos(view:brace_match(view:search_in_target('[\\(\\[\\{\\)\\]\\}]'), 0))
+end
 
 -- scroll keeping the cursor at the same location on screen
 function M.half_page_down(view) ; end -- ctrl+d
@@ -284,173 +186,202 @@ function M.line_up_vc_home(view) ; end -- -
 function M.line_down_vc_home(view) ; end -- +
 function M.line_down_end(view) ; end -- $
 
+-- extend without wrapping
+function M.char_left_extend_not_line(view) -- X
+	local line, pos = view:get_cur_line()
+	if pos > 1 then
+		view:char_left_extend()
+	end
+end
+function M.char_right_extend_not_line(view) -- x
+	local line = view:line_from_position(view.current_pos)
+	if view.current_pos < view.line_end_position[line] then
+		view:char_right_extend()
+	end
+end
+
 -- buffer cut/copy commands
-function M.buffer_cut_char_right(view) ; end -- x
-function M.buffer_cut_char_left(view) ; end -- X
-function M.buffer_cut(view) ; end -- d
-function M.buffer_copy(view) ; end -- y
-function M.buffer_paste(view) ; end -- p
+function M.reg_cut(view) -- d
+	local text = view:get_sel_text()
+	view:clear()
+	return text
+end
+function M.reg_copy(view) -- y
+	local text = view:get_sel_text()
+	view.current_pos = view.anchor
+	return text
+end
 
 -- file, path, current line, total lines, modified, readonly
 function M.display_information(view) ; end
 
--- a command is a sequence of functions and optional fields
--- numeric indices will be called in order, with the last index called [count] times
--- if the last index is non-function then count is ignored
--- all functions are called with the active view as the first parameter
--- state field indicates next state for state machine, for commands with args or motions
--- args field is unpacked and passed to all functions (after view)
--- any fields with the same key as command parts overwrite those command parts (for aliases such as D)
+-- This should probably be moved to init.lua for clarity.
+
+--- A definition is a sequence of functions with optional fields
+--  numeric indices will be called in order, with the last index called [count] times
+--  all functions are called with the active view as the first parameter
+--  if arg is specified it will be passed as the second parameter
+-- @field state indicates next state to call, for commands with args or motions
+-- @field func called with command as argument, result is packed,
+--	view inserted at front, unpacked and passed to all functions
+-- @field after called with argfunc as argument after the last command is repeated
+-- @field getreg if true, pass the text of the specified register to the command as the second argument
 local v = view
 M.commands = {
 	h = {M.char_left_not_line}, ['ctrl+h'] = {M.char_left_not_line}, ['\b'] = {M.char_left_not_line},
 	j = {v.line_down}, ['\n'] = {v.line_down}, ['ctrl+j'] = {v.line_down}, ['ctrl+n'] = {v.line_down},
 	k = {v.line_up}, ['ctrl+p'] = {v.line_up},
-	l = {M.char_right_not_line(view)}, [' '] = {M.char_right_not_line(view)},
+	l = {M.char_right_not_line}, [' '] = {M.char_right_not_line},
 	w = {v.word_right},
 	W = {M.bigword_right},
 	b = {v.word_left},
 	B = {M.bigword_left},
 	e = {v.word_right_end},
 	E = {M.bigword_right_end},
-	H = {M.screen_top, v.line_down},
-	M = {M.screen_middle},
-	L = {M.screen_bottom, v.line_up},
-	G = {v.goto_line},
-	['0'] = {v.home, 0},
+	H = {M.screen_top, v.line_up, v.line_down, after = v.vc_home},
+	M = {M.screen_middle, after = v.vc_home},
+	L = {M.screen_bottom, v.line_up, after = v.vc_home},
+	G = {after = v.goto_line, func = function (self) return self.count end},
+	['0'] = {v.home, count = 1},
 	['$'] = {v.line_end, v.line_down_end},
-	['^'] = {v.vc_home, 0},
-	['+'] = {v.line_down_vc_home}, ['ctrl+m'] = {v.line_down_vc_home},
-	['-'] = {v.line_up_vc_home},
+	['^'] = {v.vc_home, count = 1},
+	['+'] = {v.line_down, after = v.vc_home}, ['ctrl+m'] = {v.line_down, after = v.vc_home},
+	['-'] = {v.line_up, after = v.vc_home},
 	['|'] = {v.home, v.char_right},
+	['%'] = {M.brace_right_match, count = 1},
+	['_'] = {v.line_up, v.line_down, after = v.vc_home},
+	['('] = {M.sentence_last},
+	[')'] = {M.sentence_next},
+	['{'] = {v.para_up},
+	['}'] = {v.para_down},
 	['ctrl+f'] = {v.page_down},
 	['ctrl+b'] = {v.page_up},
 	['ctrl+d'] = {M.half_page_down},
 	['ctrl+u'] = {M.half_page_up},
 	['ctrl+e'] = {v.line_scroll_down},
 	['crtl+y'] = {v.line_scroll_up},
-	['esc'] = {0}, -- cancel current chain
---	['%'] = {v.brace_match, 0, args = {v.current_pos}},
-	['_'] = {v.vc_home, line_down_vc_home},
-	['('] = {M.sentence_last},
-	[')'] = {M.sentence_next},
-	['{'] = {v.para_up},
-	['}'] = {v.para_down},
--- search
---[[	[';'] = {repeat_find},
-	[','] = {reverse_find},
-	['/'] = {search, 0},
-	['?'] = {search_back, 0},
-	n = {repeat_find, 0},
-	N = {reverse_find, 0},
+--[[ search
+	[';'] = {M.repeat_find},
+	[','] = {M.reverse_find},
+	['/'] = {M.search, count = 1},
+	['?'] = {M.search_back, count = 1},
+	n = {M.repeat_search, count = 1},
+	N = {M.reverse_search, count = 1},
 -- editor
-	['.'] = {last_command},
-	[':'] = {ex_command, 0},
-	['ctrl+g'] = {display_information, 0},
-	['ctrl+^'] = {ui.switch_buffer, 0},
-	['&'] = {0} -- repeat last ex s command
+	['.'] = {M.repeat_edit}, --
+	[':'] = {M.ex_command, 0},
+	['&'] = {M.nop} -- repeat last ex s command
+	['ctrl+g'] = {display_information, M.nop},
+	['ctrl+^'] = {ui.switch_buffer, M.nop},
 -- editing
-	['~'] = {reverse_case},
 	J = {textadept.editing.join_lines},
+	['~'] = {M.reverse_case},
 -- buffer commands
-	p = {},
-	P = {},
-	s = {command = 'c', motion = ' '}, -- {buffer}{count} c<space>
-	S = {command = 'c', motion = '_'}, -- {buffer}{count} c_
-	x = {cut_char_left}, -- but don't join lines
-	X = {cut_char_right}, -- but don't join lines, figure that out
+	p = {v.add_text, func = function (c) return c:reg_text() end},
+	P = {v.add_text, func = function (c) return c:reg_text() end},
+	s = {command = 'c', motion = Motion.new(' ')}, -- {buffer}{count} c<space>
+	S = {command = 'c', motion = Motion.new('_')}, -- {buffer}{count} c_
+	x = {M.char_right_extend_not_line, after = M.buffer_cut}, -- but don't join lines
+	X = {M.char_left_extend_not_line, after = M.buffer_cut}, -- but don't join lines, figure that out
 -- mark commands
-	m = {mark, 0, state = state.mark}
-	["'"] = {return_to_mark, vc_home, 0, state = state.mark},
-	['`'] = {return_to_mark, 0, state = state.mark},
+	m = {mark, 0, state = State.mark}
+	["'"] = {return_to_mark, vc_home, 0, state = State.arg},
+	['`'] = {return_to_mark, 0, state = State.arg},
 -- char commands
-	f = {state = state.char},
-	F = {state = state.char},
-	t = {state = state.char},
-	T = {state = state.char},
-	r = {state = state.char},
+	f = {state = State.arg},
+	F = {state = State.arg},
+	t = {state = State.arg},
+	T = {state = State.arg},
+	r = {state = State.arg},
 	['@'] = {eval_buffer, state = state.char}, -- run the contents of a buffer as if it was typed
 -- motion commands
 	d = {v.cut},
-	D = {command = 'd', motion = '$'}, -- {buffer} d$
+	D = {command = 'd', motion = Motion.new('$')}, -- {buffer} d$
 	y = {},
-	Y = {command = 'y', motion = '_'}, -- {buffer}{count} y_
+	Y = {command = 'y', motion = Motion.new('_')}, -- {buffer}{count} y_
 	['!'] = {}, -- open command entry and run a system command
 	['<'] = {},
 	['>'] = {},
 -- motion, buffer, and mode change
-	c = {state = state.motion},
-	C = {command = 'c', motion = '$'}, -- {buffer}{count} c$
+	c = {state = State.motion},
+	C = {command = 'c', motion = Motion.new('$')}, -- {buffer}{count} c$
 -- input mode commands
 ]]
---	a = {state = state.input},
---	A = {state = state.input},
-	i = {state = state.input},
---	I = {state = state.input},
---	o = {state = state.input},
---	O = {state = state.input},
---	R = {state = state.input},
+--	a = {state = State.input},
+--	A = {state = State.input},
+--	i = {state = State.input, output = '-- INSERT --'},
+--	I = {state = State.input},
+--	o = {state = State.input},
+--	O = {state = State.input},
+--	R = {state = State.input},
 }
+State.commands = M.commands
+
+-- ### Motion definition table ###
 
 -- Valid motions for ! < > c d y
--- Motion table format is same as command format.
--- "move extends selection" is set to true after first command
--- and restored after last command has been repeated.
+-- Set view.move_extends_selection = true before and = false after
+-- Motion definitions format is the same as command definition.
 M.motions = {
-	"'",         
-	',',
-	'ctrl+h',
-	'ctrl+n',
-	'ctrl+p',
-	'`',
-	'\n',
-	' ',
-	'0',
-	'(',
-	')',
-	'[',
-	']',
-	'{',
-	'}',
-	'^',
-	'+',
-	'|',
-	'/',
-	'-',
-	'$',
-	'%',
-	'_',
-	';',
-	'?',
-	'b',
-	'e',
-	'f',
-	'h',
-	'j',
-	'k',
-	'l',
-	'n',
-	't',
-	'w',
-	'B',
-	'E',
-	'F',
-	'G',
-	'H',
-	'L',
-	'M',
-	'N',
-	'T',
-	'W',
+	h = {M.char_left_extend_not_line}, 	['ctrl+h'] = {M.char_left_extend_not_line},
+	j = {v.home, v.line_down_extend, after = v.end_extend},
+	['ctrl+n'] = {v.home, v.line_down_extend, after = v.end_extend},
+	['\n'] = {v.home, v.line_down_extend, after = v.end_extend},
+	k = {v.line_end, v.home_extend, v.line_up_extend},
+	['ctrl+p'] = {v.line_end, v.home_extend, v.line_up_extend},
+	l = {M.char_right_extend_not_line},
+	[' '] = {M.char_right_extend_not_line},
+	w = {v.word_right_extend},
+	W = {M.bigword_right_extend},
+	b = {v.word_left_extend},
+	B = {M.bigword_left_extend},
+	e = {v.word_right_end_extend},
+	E = {M.bigword_right_end_extend},
+	H = {v.home, v.line_down, M.screen_top_extend, v.line_up_extend, v.line_down_extend},
+	M = {},
+	L = {v.line_end, M.screen_bottom_extend, v.line_down_extend, v.line_down_extend, v.line_up_extend},
+	G = {},
+	['0'] = {},
+	['('] = {},
+	[')'] = {},
+	['{'] = {},
+	['}'] = {},
+	['^'] = {},
+	['+'] = {},
+	['|'] = {},
+	['-'] = {},
+	['$'] = {},
+	['%'] = {},
+	['_'] = {},
+-- search motions
+	n = {},
+	N = {},
+	[','] = {},
+	[';'] = {},
+	['/'] = {},
+	['?'] = {},
+-- char motions
+	f = {},
+	t = {},
+	F = {},
+	T = {},
+	["'"] = {},
+	['`'] = {},
+-- convenience motions
+	y = {},
+	d = {},
+	c = {},
+	['>'] = {},
+	['<'] = {},
+	['!'] = {},
 }
+State.motions = M.motions
 
--- module functions below
-
+local installed = false
 -- function to allow vi_mode to be assigned to a keycode
-local current_state = state.start
+current_state = State.start
 local function handle_keypress(key)
 	if current_state == nil then
-		registered = false
 		events.disconnect(handle_keypress)
 		return false
 	end
@@ -461,10 +392,7 @@ end
 
 meta = {__call =
 	function ()
-		if not registered then
-			events.connect(events.KEYPRESS, handle_keypress, 1)
-			registered = true
-		end
+		events.connect(events.KEYPRESS, handle_keypress, 1)
 	end,
 }
 setmetatable(M, meta)
