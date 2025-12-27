@@ -1,18 +1,12 @@
 -- Copyright (c) 2025 Fwirt. See LICENSE.
 
--- vi state machine class for vitamin
+-- vitamin command field utility functions
 
 local Command = require('vitamin.command')
 
-local M = {}
+local fetch = {}
 
-M.escape_keycode = 'esc'
-M.exit_mode_keycode = 'ctrl+esc'
-
--- definition tables for commands and motions, should be
--- initialized prior to installing the key handler.
-M.commands = {}
-M.motions = {}
+fetch.escape_keycode = 'esc'
 
 -- The following is an implementation of a state
 -- machine that implements the vi command grammar:
@@ -65,124 +59,107 @@ local function match_printable(char)
 	return false
 end
 
-M.start = function (key, command)
+fetch.start = function (key, command)
+	command = Command(Command.commands)
 	if #key == 1 then
 		if key == '"' then
-			return true, M.register
-		elseif key ~= 0 and match_digit(key) then
-			return M.count(key, command)
+			return true, fetch.register
+		elseif key ~= '0' and match_digit(key) then
+			return fetch.count(key, command)
 		end
 	end
-	return M.command(key, command)
+	return fetch.command(key, command)
 end
 
-M.register = function (key, command)
-	if #key == 1 and match_alphanum(key) then
-		command.output = command.output .. key
+fetch.register = function (key, command)
+	if #key == 1 and match_printable(key) then
+		command.status = command.status .. key
 		command.register = key
-		return true, M.count
-	else
-		return M.error(key, command)
+		return true, fetch.count
 	end
+	error('register must be a single printable character')
 end
 
-M.count = function (key, command)
+fetch.count = function (key, command)
 	if #key == 1 and match_digit(key) then
-		command.output = command.output .. key
+		command.status = command.status .. key
+		if not command.count then command.count = 0 end
 		command.count = command.count * 10 + tonumber(key)
-		return true, M.count
+		return true, fetch.count
 	else
-		return M.command(key, command)
+		return fetch.command(key, command)
 	end
 end
 
-M.command = function (key, command)
-	-- since this state passes unhandled keys we need an escape hatch
-	if key == M.escape_keycode then
-		command.output = M.escape_keycode
-		return true, M.start
+--- Command is being specified
+fetch.command = function (key, command)
+	command.keycode = key
+	command.status = command.status .. key
+	command = command()
+	if command.needs then
+		return true, command.needs
 	end
-	local def = M.commands[key]
-	if def == nil then -- undefined function
-		if command.register or command.count > 0 then -- invalid
-			return M.error(key, command)
-		else
-			return true, M.start
-		end
-	else
-		command.output = command.output .. key
-		command.def = def
-		if def.state then
-		    return true, def.state
-		else
-			return M.complete(key, command)
-		end
-	end
+	return true, fetch.start
 end
 
--- for m ` ' @ t T f F
-M.arg = function (key, command)
+--- Command argument is being specified.
+-- for m ` ' @ t T f F (or special commands)
+fetch.arg = function (key, command)
 	if #key == 1 and match_printable(key) then -- #key implicitly filters tab
-		command.output = command.output .. key
-		if type(command.arg) == 'table' then
-			command.motion.arg = key
-		else
-			command.arg = key
+		command.status = command.status .. key
+		command.arg = key
+		command.needs = nil
+		command = command()
+		if command.needs then
+			return true, command.needs
 		end
-		return M.complete(key, command)
+		return true, fetch.complete(key, command)
 	end
+	error('arg to '..command.keycode..' must be a printable char')
 end
 
--- combined count and motion into one state for clarity
-M.motion = function (key, command)
-	if #key == 1 and match_digit(key) then
-		command.output = command.output .. key
-		command.motion_count = command.motion_count * 10 + tonumber(key)
-	else
-		local def = M.motions[key]
-		if def == nil then
-			return M.error(key, command)
-		else
-			command.motion = def
-			command.output = command.output .. key
-			if def.state then
-				return true, func.state
-			else
-				return M.complete(key, command)
-			end
-		end
+--- Command motion is being specified.
+fetch.motion = function (key, command)
+	command.sub = Command(Command.motions)
+	command = command.sub()
+	if command.needs then
+		return true, command.needs
 	end
+	return true, fetch.start
 end
 
--- in input mode, passthrough everything but escape keycode
--- but catch printable chars for repetition.
-M.input = function (key, command)
-	command.output = command.def.output
-	-- need to install/remove an event handler that catches
+--- In input mode, passthrough everything but escape keycode.
+--  Also catch printable characters for repetition.
+fetch.input = function (key, command)
+	-- TODO: install/remove an event handler that catches
 	-- text added to the Scintilla element so we can replay it.
-	if key == M.escape_keycode then
-		return M.complete(key, command)
+	-- TODO: handle Unicode text entry?
+	if key == Command.escape_keycode then
+		return fetch.complete(key, command)
 	else
-		-- TODO: handle Unicode
-		return false, M.input
+		return false, fetch.input
 	end
 end
 
--- command is ready for execution
-M.complete = function (key, command)
-	if key == M.exit_mode_keycode then return true, nil end
-	command()
-	M.history[#history+1] = command
-	return true, M.start
+--- When prompting for input, pop the command entry and have the
+--  keypress handler wait to do anything until the entry function
+--  returns.
+fetch.prompt = function (key, command)
+	ui.command_entry.prompt(command.prompt, function (text)
+		command.text = text
+		command = command()
+		if not command.needs then 
+	end)
+	return true, 
 end
 
--- command was improperly formatted or escaped
-M.error = function (key, command)
-	-- cancelling command is not an error
-	if key == M.escape_keycode then return true, M.start end
-	command.output = "error"
-	-- TODO: identify the error here
-	return true, M.start
+--- Do nothing until the current command finishes.
+--  This is used for the command entry. When the command entry function
+--  finishes, it should set `command.needs` to an appropriate value,
+--  presumably fetch.start
+fetch.wait = function (key, command)
+	return true, command.needs
 end
 
-return M
+
+return fetch
