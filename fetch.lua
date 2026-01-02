@@ -19,6 +19,7 @@
 -- EMPTY := the empty string
 
 local Command = require('vitamin.command')
+local registers = require('vitamin.registers')
 
 local fetch = {}
 
@@ -40,7 +41,7 @@ fetch.dittos = {}
 fetch.default_sub = '_'
 
 --- The default prompt if one is not specified.
-fetch.prompt = 'Vitamin:'
+fetch.default_prompt = 'Vitamin:'
 
 --- Event handler to capture chars that are typed into the buffer in input mode.
 --  To prevent memory leaks, we just attach this to the event that's currently
@@ -49,6 +50,7 @@ fetch.prompt = 'Vitamin:'
 local input_command
 local function input_handler(code)
 	if input_command then
+		if input_command.text == nil then input_command.text = '' end
 		input_command.text = input_command.text .. utf8.char(code)
 	end
 end
@@ -87,7 +89,7 @@ local function match_printable(char)
 	return false
 end
 
-fetch.start = function (command, key)
+function fetch.start(command, key)
 	command = Command(Command.commands)
 	input_command = nil
 	if #key == 1 then
@@ -103,17 +105,17 @@ fetch.start = function (command, key)
 	return fetch.command(command, key)
 end
 
-fetch.register = function (command, key)
+function fetch.register(command, key)
 	if #key == 1 and match_printable(key) then
 		command.status = command.status .. key
-		command.register = key
+		command.reg = key
 		command.needs = fetch.count
 		return true, command
 	end
 	error('register must be a single printable character')
 end
 
-fetch.count = function (command, key)
+function fetch.count(command, key)
 	if #key == 1 and match_digit(key) then
 		command.status = command.status .. key
 		if not command.count then command.count = 0 end
@@ -126,7 +128,7 @@ fetch.count = function (command, key)
 	end
 end
 
-fetch.command = function (command, key)
+function fetch.command(command, key)
 	-- handle subcommand "dittos"
 	if command.parent and command.parent.keycode == key then
 		key = fetch.dittos[key] or fetch.default_sub
@@ -140,7 +142,7 @@ end
 
 --- Get a single printable ASCII character.
 --  For m ` ' @ t T f F (or other commands)
-fetch.arg = function (command, key)
+function fetch.arg(command, key)
 	if #key == 1 and match_printable(key) then -- #key implicitly filters tab
 		command.status = command.status .. key
 		command.needs = nil
@@ -153,40 +155,46 @@ end
 
 --- Subcommand is being specified.
 --  A subcommand replaces the current command in the chain, but
---  only takes an optional count. The subcommand will recursively call the
---  parent after it finishes its action.
-fetch.subcommand = function (command, key)
+--  only takes an optional count, and inherits its register from the
+--  parent. The subcommand will recursively call the parent after it
+--  finishes its action.
+function fetch.subcommand(command, key)
 	command.needs = nil
 	local sub = Command(Command.motions)
 	sub.parent = command
+	sub.reg = command.reg
 	sub.needs = fetch.count
 	return sub.needs(sub, key)
 end
 
 --- In input mode, passthrough everything but escape keycode.
 --  Also catch printable characters for repetition.
-fetch.input = function (command, key)
+function fetch.input(command, key) -- TODO: Maybe break out a second state?
 	if key == fetch.escape_keycode then
 		input_command = nil
+		command.needs = nil
+		command.status = key
 		command = command()
 		return true, command
 	else
+		input_command = command
 		command.needs = fetch.input
-		return false, command
+		return nil, command
 	end
 end
 
---- When prompting, pop the command entry and have the
---  keypress handler wait to do anything until the entry function
---  returns.
-fetch.prompt = function (command, key)
-	ui.command_entry.run(command.prompt or command.keycode or fetch.prompt, function (text)
+--- Open the command entry and store the result in a register.
+--  To be called by `command.before`. The register is the keycode of
+--  the command.
+function fetch.prompt(command)
+	ui.command_entry.run(command.prompt, function (text)
+		command.before = nil
 		command.needs = nil
-		command.text = text
-		command = command() -- this should set command.needs and exit the wait loop
+		registers[command.reg.name or command.keycode or ''] = text
+		command = command()
 	end)
 	command.needs = fetch.prompt_wait
-	return true, command
+	return Command.default_before(command)
 end
 
 --- Do nothing until the command entry closes.
@@ -195,10 +203,10 @@ end
 --  block while we wait for command input. If the user cancels the
 --  command entry or it loses focus, then the prompt function will
 --  never fire and the state machine will get stuck so just run the
---  command. Commands should be able to handle blank text input.
-fetch.prompt_wait = function (command, key)
+--  command. Commands should be able to handle nil text input.
+function fetch.prompt_wait(command, key)
 	if ui.command_entry.active then
-		return true, command
+		return nil, command
 	else
 		command.needs = nil
 		command = command()
@@ -212,6 +220,12 @@ local current_command = nil
 local safe_handle_keypress
 --- Vitamin events.KEYPRESS handler.
 local function handle_keypress(key)
+	--ui.print_silent_to('debug', 'before..'..tostring(current_command)..' '..tostring(current_command and current_command.needs))
+	if ui.command_entry.active then return nil end -- prevent command entry/find dialog blocking
+	if key == fetch.escape_keycode then
+		current_command = Command() -- cancel chain
+		return nil
+	end
 	if key == fetch.exit_keycode then
 		events.emit(fetch.DISCONNECT)
 		--events.disconnect(events.KEYPRESS, handle_keypress)
@@ -221,6 +235,7 @@ local function handle_keypress(key)
 	if not current_command then current_command = Command() end
 	local success, handled
 	success, handled, current_command = pcall(current_command.needs or fetch.start, current_command, key)
+	--ui.print_silent_to('debug', 'after..'..tostring(success)..' '..tostring(handled)..' '..tostring(current_command)..' '..tostring(current_command and current_command.needs))
 	if not success then 
 		Command.output('ERROR: '..handled)
 		current_command = Command()
@@ -229,6 +244,7 @@ local function handle_keypress(key)
 		return handled
 	end
 end
+
 --- Prevent a key handler errors from locking up Textadept
 safe_handle_keypress = function (key)
 	local success, result = pcall(handle_keypress, key)
@@ -242,7 +258,7 @@ safe_handle_keypress = function (key)
 	end
 end
 
-fetch.connect = function ()
+function fetch.connect()
 	events.emit(fetch.CONNECT)
 	current_command = Command()
 	events.connect(events.KEYPRESS, safe_handle_keypress, 1)

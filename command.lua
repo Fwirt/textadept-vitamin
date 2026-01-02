@@ -1,7 +1,6 @@
 -- Copyright (c) 2025 Fwirt. See LICENSE.
 
 -- Command class for vitamin
-
 Command = {}
 
 --- A command object describes a vi command. A vi command is composed of
@@ -53,13 +52,8 @@ Command = {}
 -- `Command.output` is called with its new value.
 -- @table command
 
---- Holds the vi registers (buffers).
---  Indexed on register name (In this implementation, any single printable
---  character is a valid register name.)
---  If an element is a table it is in line mode, otherwise it is converted
---  to a string and is in char mode. This allows registers to be portable
---  across buffers with different line endings.
-Command.registers = {}
+registers = require('vitamin.registers')
+FuncTable = require('vitamin.functable')
 
 --- Definitions that map a keycode to a sequence of functions to be executed.
 -- Each element in this table is indexed on a keycode and contains a table of Command
@@ -80,10 +74,48 @@ Command.output = function (text)
 end
 
 --- Default value of `command.before`.
---  Defined here to be used by `Command.multikey`. Also used in the
---  object constructor.
-local function default_before(command)
+--  Called if `command.before` is not defined. Should be called from
+--  any `before` function that does not return a value by default.
+Command.default_before = function (command)
 	return command.arg
+end
+
+--- Default prompt value for anonymous commands.
+--  Used in the object metatable.
+Command.default_prompt = "Vitamin: "
+
+--- Save the `view.current_pos` to `command.pos`.
+--  Use in `command.before` of subcommand to save `view.current_pos` to
+--  `command.pos`, then use `Command.load_pos` in `command.after` of parent
+--  command to prevent cursor from moving.
+Command.save_pos = function (command)
+	command.pos = view.current_pos
+	return Command.default_before(command)
+end
+
+--- Load the previous pos from the subcommand.
+--  Use in `command.before` of parent to restore position after selection is processed.
+--  Calls existing `command.after` before restoring position.
+Command.restore_pos_after = function (command)
+	local after_pos = command.sub and command.sub.pos or view.current_pos
+	local current_after = command.after
+	command.after = function (...)
+		if current_after then current_after(...) end
+		view:goto_pos(after_pos)
+	end
+	return Command.default_before(command)
+end
+
+--- Shorthand to allow use of existing movement commands to extend selection
+Command.extend = function (command)
+	local after_extend = view.move_extends_selection
+	local current_after = command.after
+	view.move_extends_selection = true
+	command.after = function (...)
+		if current_after then current_after(...) end
+		view.move_extends_selection = after_extend
+	end
+	return Command.default_before(command)
 end
 
 --- Allows the command and motion tables to contain longer keycodes.
@@ -96,39 +128,35 @@ Command.multikey = function (newdef)
 		if not command.arg then error('command "'..command.keycode..'" requires a second key', 0) end
 		command.def = newdef
 		command.keycode = command.keycode .. command.arg
-		-- re-initialize command (except for special fields)
+		-- re-initialize public command fields
+		command.before = nil -- prevent circular calls
 		for key, field in pairs(command) do command[key] = nil end
-		command.before = default_before
-		command.text = ''
 		-- write in new definition
 		for key, field in pairs(command.def) do command[key] = field end
 		command.def = {}
-		-- pretend we just ran the first def, we may need to process an arg
+		-- pretend we just copied the first def, we may need to process an arg
 		if not command.needs then return command.before(command) end
 	end
 end
 
-local function is_upper(char)
-	local byte = string.byte(char or '')
-	return byte <= 90 and byte >= 65
+--- Returns the command register contents as text to be used by view methods.
+--  To be assigned to `command.before`. Also returns `reg.mode` for use by p.
+Command.get_reg = function (command)
+	return command.reg()
 end
 
-local function get_eol_chars(text)
-	local mode = view.eol_mode
-	if mode == view.EOL_LF then
-		return '\n'
-	elseif mode == view.EOL_CRLF then
-		return '\r\n'
-	elseif mode == view.EOL_CR then
-		return '\r'
-	else
-		return ''
-	end
+--- Multiply the count by the count of the parent command.
+--  For subcommands (motions) the total motion should be multiplied by the
+--  parent's `command.count`. Then sets parent count to 1 since it shouldn't
+--  be used by the parent command.
+Command.parent_times = function (command)
+	command.count = (command.count or 1) * (command.parent and command.parent.count or 1)
+	if command.parent then command.parent.count = 1 end
 end
 
 local function split_lines(text)
 	local result = {}
-	for line in string.gmatch(text, "([^\r\n]*)") do
+	for line in string.gmatch(text, get_eol()) do
 		table.insert(result, line)
 	end
 	return result
@@ -138,18 +166,26 @@ local function ensure_string(s) return type(s) == 'string' and s or '' end
 
 --- Invoke the command object.
 --  See the command object definition for how the command elements affect
---  its invocation. The subcommand argument should be provided if this
---  command is being recursively invoked, so that the parent command can
---  examine the subcommand object's fields to determine what action was
---  performed.
+--  its invocation. 
+--  @param subcommand The subcommand argument should be provided if this
+--  command is being recursively invoked from the child, so that the parent command can
+--  examine the subcommand object's fields to determine what action was performed.
 local function call(command, subcommand)
 	-- insert and override values from definition
 	-- do before `before` so `before` can override
 	for key, field in pairs(command.def) do command[key] = field end
-	command.def = {}
+	command.def = {} -- clear so we don't overwrite subsequent calls
+	if command.sub then -- if a command definition contains a subcommand
+		command.sub.parent = command
+		command.sub.reg = command.reg
+		subcommand = command.sub() -- invoke it first
+		if command.sub.needs then return command.sub end -- and then switch to it if needed
+	end
 	if command.needs then return command end
-	-- load arguments for functions and mutate command
-	local args = {view, command.before(command)}
+	-- prevent circular references for gc and make subcommand available for `command.before`
+	if subcommand then command.sub = subcommand ; subcommand.parent = nil end
+	-- execute "before" function(s).
+	local args = {view, FuncTable(command.before)(command)}
 	if command.needs then return command end
 	-- check count after func so func can check for nil and set 0
 	command.count = type(command.count) == 'number' and command.count or 1
@@ -164,56 +200,17 @@ local function call(command, subcommand)
 			results = results .. ensure_string(command[#command](table.unpack(args)))
 		end
 	end
-	-- execute "after" function
-	if type(command.after) == 'function' then
-		results = results .. ensure_string(command.after(table.unpack(args)))
-	end
+	-- execute "after" function(s)
+	local r = {FuncTable(command.after)(args)}
+	for _, s in ipairs(r) do results = results .. ensure_string(s) end
 	-- set the register(s) to the command results, if any
-	if #results > 0 then 
-		Command.registers[''] = results -- set the default register
-		if command.reg then
-			if is_upper(command.reg.key) then -- append if register is uppercase
-				if command.reg.mode == 'line' then
-					for _, v in split_lines(results) do table.insert(register.text, v) end
-				else
-					register.text = register.text .. results
-				end
-			else
-				register.text = results
-			end
-		end
+	if #results > 0 then
+		command.reg.text = results
+		registers[''].text = results -- always set the unnamed register
 	end
 	command.needs = nil
 	return command.parent and command.parent(command) or command
 end
-
-local reg_meta = {
-	__index = function (self, index)
-		if index == 'key' then return rawget(self, 'key') or '' end
-		local reg = Command.registers[self.key]
-		if index == 'text' then
-			return reg
-		elseif index == 'mode' then
-			return type(reg) == 'table' and 'line' or 'char'
-		else
-			return rawget(self, index)
-		end
-	end,
-	__newindex = function (self, index, value)
-		if index == 'key' then rawset(self, index, value) ; return end
-		local reg = Command.registers[self.key]
-		if index == 'mode' and value == 'line' and self.mode == 'char' then
-			Command.registers[self.key] = split_lines(reg)
-		elseif index == 'mode' and value == 'char' and self.mode == 'line' then
-			Command.registers[self.key] = table.concat(reg, ' ')
-		elseif index == 'text' then
-			Command.registers[self.key] = value
-		else
-			rawset(self, index, value)
-		end
-	end,
-	__tostring = function (self) return self.key end,
-}
 
 --- Command object constructor.
 --  @param def A table containing either a mapping of keycodes to definition tables,
@@ -222,7 +219,7 @@ function Command.new(def)
 	local def = def or Command.commands
 	if type(def) ~= 'table' then error('argument must be a table', 2) end
 	
-	local register = setmetatable({}, reg_meta)
+	local register = registers['']
 	-- Prevent parent definition table from being modified
 	local def_meta = {
 		__index = function (self, index)
@@ -244,13 +241,13 @@ function Command.new(def)
 			elseif index == 'keycode' then return keycode
 			elseif index == 'def' then return shadow_def
 			elseif index == 'reg' then return register
+			elseif index == 'before' then return Command.default_before
+			elseif index == 'prompt' then return keycode or Command.default_prompt
 			elseif index then return rawget(self, index)
 			end
 		end,
 		__newindex = function (self, index, value)
-			if index == 'reg' then
-				register.key = tostring(value)
-			elseif index == 'status' then
+			if index == 'status' then
 				status = value
 				Command.output(tostring(status))
 			elseif index == 'def' then
@@ -259,13 +256,21 @@ function Command.new(def)
 			elseif index == 'keycode' then
 				if not def[value] then error('undefined command "'..tostring(value)..'"', 0)
 				else keycode = value ; def = def[value] end
+			elseif index == 'reg' then
+				if type(value) == 'table' then
+					if value.name then
+						register = registers[value.name]
+					end
+					for i, v in pairs(value) do
+						register[i] = v
+						registers[''][i] = v
+					end
+				else register = registers[value] end
 			elseif index then
 				return rawset(self, index, value)
 			end
 		end
 	})
-	command.before = default_before
-	command.text = ''
 	return command
 end
 

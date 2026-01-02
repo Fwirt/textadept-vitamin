@@ -20,14 +20,19 @@
 --   	(ctrl+d, ctrl+h, ctrl+j, ctrl+m, ctrl+u, ctrl+w)
 
 -- TODO:
--- +TA bookmarks only mark lines so implement character marking
+-- +regex search and char find should store last search in registers, for
+-- search use a custom field on the register table to store last position.
 -- +Implement all the stubbed and commented out functions
+-- +Merge motions and commands table into one (just make motion keycodes be
+-- multikeys with some untypeable character at the front like \0)
+-- +TA bookmarks only mark lines so implement character marking
 -- +Implement input mode repetition w/ count
 -- +Add flag to include style bytes in argument to M.output
 -- +Line undo mode?
 -- +ctags? (needs ex commands)
 
 local fetch = require('vitamin.fetch')
+local registers = require('vitamin.registers')
 local Command = require('vitamin.command')
 
 local M = {}
@@ -71,16 +76,6 @@ local current_command
 --  Most movements use regex because it works with UTF-8
 --  automatically.
 
---- Search by C++11 ECMAScript regex in the active view.
---  Start from view.current_pos +/- offset, end at specified
---  location.
-local function regex_search(regex, start_offset, target_end)
-	view.search_flags = view.FIND_REGEXP | view.FIND_CXX11REGEX
-	view.target_start = view.current_pos + start_offset
-	view.target_end = target_end or view.length
-	return view:search_in_target(regex)
-end
-
 --- Move without wrapping.
 --  Because setting vs_no_wrap_line_start would work for left but not right.
 function M.char_left_not_line(view) -- h
@@ -91,14 +86,56 @@ function M.char_left_not_line(view) -- h
 end
 function M.char_right_not_line(view) -- l
 	local line = view:line_from_position(view.current_pos)
-	if view.current_pos < view.line_end_position[line] then
+	-- cursor is not allowed to move onto newline
+	if view.current_pos < view.line_end_position[line] - 1 then
 		view:char_right()
+	end
+end
+
+--- Move without wrapping.
+--  Because setting vs_no_wrap_line_start would work for left but not right.
+function M.char_left_extend_not_line(view) -- h
+	local line, pos = view:get_cur_line()
+	if pos > 1 then
+		view:char_left_extend()
+	end
+end
+function M.char_right_extend_not_line(view) -- l
+	local line = view:line_from_position(view.current_pos)
+	-- extension is allowed onto line end
+	if view.current_pos < view.line_end_position[line] then
+		view:char_right_extend()
 	end
 end
 
 --- Goto visible column number (not character).
 function M.goto_column(view, column)
 	view:goto_pos(view:find_column(view:line_from_position(view.current_pos), column or 1))
+end
+
+--- Search by C++11 ECMAScript regex in the active view.
+--  Start from view.current_pos +/- offset, end at specified
+--  location.
+local function regex_search(regex, start_offset, target_end)
+	view.search_flags = view.FIND_REGEXP | view.FIND_CXX11REGEX
+	view.target_start = view.current_pos + start_offset
+	view.target_end = target_end or view.length
+	return view:search_in_target(regex)
+end
+
+M.search_forward = function (command)
+	if command.text ~= nil then
+		if regex_search(command.text, 0) >= 0 then view:goto_pos(view.target_start)
+		else command.status = 'No match found for "'..command.text..'"'
+		end
+	end
+end
+M.search_backward = function (command)
+	if command.text ~= nil then
+		if regex_search(command.text, 0, 0) >= 0 then view:goto_pos(view.target_start)
+		else command.status = 'No match found for "'..command.text..'"'
+		end
+	end
 end
 
 --- Move by bigword /[\s\t\n]+.*[\s\t\n]/.
@@ -253,18 +290,6 @@ function M.char_right_extend_not_line(view) -- x
 	end
 end
 
--- buffer cut/copy commands
-function M.reg_cut(view) -- d
-	local text = view:get_sel_text()
-	view:clear()
-	return text
-end
-function M.reg_copy(view) -- y
-	local text = view:get_sel_text()
-	view.current_pos = view.anchor
-	return text
-end
-
 function M.count_or_last(command)
 	return command.count == nil and view.line_count or command.count
 end
@@ -277,18 +302,49 @@ function M.display_info(command)
 	command.status = string.format("%s Line: %d/%d %s", name, line, view.line_count, modified)
 end
 
+--- Decrement `commmand.count` before using it as repetition.
+--  If `command.count` is not set then assume 0 instead of 1.
 function M.dec_count(command)
 	command.count = command.count == nil and 0 or command.count - 1
 end
 
+--- Get `command.count` for use as an argument to `view` functions.
+--  Used for e.g. `view.goto_line` for the G command.
 function M.get_count(command)
 	return command.count == nil and 1 or command.count
 end
 
---- View alias to make definitions shorter
--- I suppose I could use the trick from command_entry where you map view's
+--- Cursor movement based on register mode for the p command.
+function M.move_p(view, text, mode)
+	if mode == 'line' then view:line_end()
+	else M.char_right_not_line(view) end
+end
+--- Cursor movement based on register mode for the P command.
+function M.move_P(view, text, mode)
+	if mode == 'line' then view:line_up() view:line_end() end
+end
+
+function M.clear_selection(view)
+	view.set_empty_selection(view, view.current_pos)
+end
+
+function M.get_and_clear(view)
+	local text = view:get_sel_text()
+	view:clear()
+	return text
+end
+
+--- View alias to make definitions shorter.
+-- TODO: I suppose I could use the trick from command_entry where you map view's
 -- metatable onto _ENV to shorten this up even more.
 local v = view
+
+--- Command alias to make definitions shorter.
+-- TODO: You should probably be able to call class methods from the table automatically.
+local C = Command
+
+--- Utility to allow commands to call arbitrary functions.
+local f = function (f, ...) args = {...} return function () f(table.unpack(args)) end end
 
 --- A definition is a sequence of functions with optional fields
 --  numeric indices will be called in order, with the last index called [count] times
@@ -343,56 +399,58 @@ local commands = {
 	['end'] = {v.line_end},
 	['pgup'] = {v.page_up},
 	['pgdn'] = {v.page_down},
---[[ search
-	[';'] = {M.repeat_find},
-	[','] = {M.reverse_find},
-	['/'] = {M.search, count = 1},
-	['?'] = {M.search_back, count = 1},
-	n = {M.repeat_search, count = 1},
-	N = {M.reverse_search, count = 1},
+-- search
+--	[';'] = {M.repeat_find},
+--	[','] = {M.reverse_find},
+	['/'] = {reg = {name = '/'}, before = {M.pre_search, fetch.prompt}, M.search_next},
+	['?'] = {reg = {name = '?'}, before = {M.pre_search, fetch.prompt}, M.search_prev},
+	n = {M.search_next, count = 1},
+	N = {M.search_prev, count = 1},
 -- editor
-	['.'] = {M.repeat_edit}, --
-	[':'] = {M.ex_command, 0},
-	['&'] = {M.nop} -- repeat last ex s command
-	['ctrl+g'] = {before = M.display_info},
-	['ctrl+^'] = {ui.switch_buffer, M.nop},
+	u = {v.undo},
+--	['.'] = {M.repeat_edit},
+--	[':'] = {M.ex_command, 0},
+--	['&'] = {M.nop} -- repeat last ex s command
+--	['ctrl+g'] = {before = M.display_info},
+--	['ctrl+^'] = {ui.switch_buffer, M.nop},
 -- editing
-	J = {textadept.editing.join_lines},
-	['~'] = {M.reverse_case},
+--	J = {textadept.editing.join_lines},
+--	['~'] = {M.reverse_case},
 -- buffer commands
-	p = {v.add_text, before = function (c) return c:reg_text() end},
-	P = {v.add_text, before = function (c) return c:reg_text() end},
-	s = {command = 'c', motion = Motion.new(' ')}, -- {buffer}{count} c<space>
-	S = {command = 'c', motion = Motion.new('_')}, -- {buffer}{count} c_
-	x = {M.char_right_extend_not_line, after = M.buffer_cut}, -- but don't join lines
-	X = {M.char_left_extend_not_line, after = M.buffer_cut}, -- but don't join lines, figure that out
+	p = {before = C.get_reg, M.move_p, v.add_text, after = M.char_left_not_line},
+	P = {before = C.get_reg, M.move_P, v.add_text, after = M.char_left_not_line},
+--	s = {command = 'c', motion = Motion.new(' ')}, -- {buffer}{count} c<space>
+--	S = {command = 'c', motion = Motion.new('_')}, -- {buffer}{count} c_
+	x = {M.char_right_extend_not_line, after = {v.get_sel_text, v.clear}},
+	X = {M.char_left_extend_not_line, after = {v.get_sel_text, v.clear}},
 -- mark commands
-	m = {mark, 0, needs = fetch.mark}
-	["'"] = {return_to_mark, vc_home, 0, needs = fetch.arg},
-	['`'] = {return_to_mark, 0, needs = fetch.arg},
+--	m = {mark, 0, needs = fetch.mark}
+--	["'"] = {return_to_mark, vc_home, 0, needs = fetch.arg},
+--	['`'] = {return_to_mark, 0, needs = fetch.arg},
 -- char commands
-	f = {needs = fetch.arg},
-	F = {needs = fetch.arg},
-	t = {needs = fetch.arg},
-	T = {needs = fetch.arg},
-	r = {needs = fetch.arg},
-	['@'] = {eval_buffer, needs = needs.char}, -- run the contents of a buffer as if it was typed
+--	f = {needs = fetch.arg},
+--	F = {needs = fetch.arg},
+--	t = {needs = fetch.arg},
+--	T = {needs = fetch.arg},
+--	r = {needs = fetch.arg},
+--	['@'] = {eval_buffer, needs = needs.char}, -- run the contents of a buffer as if it was typed
 -- motion commands
-	d = {v.cut},
-	D = {command = 'd', motion = Motion.new('$')}, -- {buffer} d$
-	y = {},
-	Y = {command = 'y', motion = Motion.new('_')}, -- {buffer}{count} y_
-	['!'] = {}, -- open command entry and run a system command
-	['<'] = {},
-	['>'] = {},
+	d = {needs = fetch.subcommand, M.get_and_clear},
+--	D = {command = 'd', motion = Motion.new('$')}, -- {buffer} d$
+	y = {needs = fetch.subcommand, before = C.restore_pos_after, v.get_sel_text},
+	q = {needs = fetch.subcommand},
+--	Y = {command = 'y', motion = Motion.new('_')}, -- {buffer}{count} y_
+--	['!'] = {}, -- open command entry and run a system command
+--	['<'] = {},
+--	['>'] = {},
 -- motion, buffer, and mode change
-	c = {needs = fetch.motion},
-	C = {command = 'c', motion = Motion.new('$')}, -- {buffer}{count} c$
+	c = {sub = Command{needs = fetch.subcommand, M.get_and_clear}, needs = fetch.input},
+--	C = {command = 'c', motion = Motion.new('$')}, -- {buffer}{count} c$
 -- input mode commands
-]]
+
 --	a = {needs = fetch.input},
 --	A = {needs = fetch.input},
---	i = {needs = fetch.input, output = '-- INSERT --'},
+	i = {needs = fetch.input, status = '-- INSERT --'},
 --	I = {needs = fetch.input},
 --	o = {needs = fetch.input},
 --	O = {needs = fetch.input},
@@ -403,62 +461,80 @@ commands['['] = {needs = fetch.arg, before = Command.multikey(commands)}
 commands[']'] = {needs = fetch.arg, before = Command.multikey(commands)}
 Command.commands = commands
 
+-- Shortcuts to make motion definition simpler
+local l = {mode = 'line'}
+local c = {mode = 'char'}
+local b = {C.parent_times, C.save_pos}
+local be = {C.parent_times, C.save_pos, C.extend}
+
 -- Valid motions for ! < > c d y
 -- Set view.move_extends_selection = true before and = false after
 -- Motion definitions format is the same as command definition.
+-- Since all of these will use `Command.parent_times`, it is implied
+-- and set in a loop after the definition.
 local motions = {
-	h = {M.char_left_extend_not_line}, 	['ctrl+h'] = {M.char_left_extend_not_line},
-	j = {v.home, v.line_down_extend, after = v.end_extend},
-	['ctrl+n'] = {v.home, v.line_down_extend, after = v.end_extend},
-	['\n'] = {v.home, v.line_down_extend, after = v.end_extend},
-	k = {v.line_end, v.home_extend, v.line_up_extend},
-	['ctrl+p'] = {v.line_end, v.home_extend, v.line_up_extend},
-	l = {M.char_right_extend_not_line}, [' '] = {M.char_right_extend_not_line},
-	w = {v.word_right_extend},
-	W = {M.bigword_right_extend},
-	b = {v.word_left_extend},
-	B = {M.bigword_left_extend},
-	e = {v.word_right_end_extend},
-	E = {M.bigword_right_end_extend},
-	H = {v.home, v.line_down, M.screen_top_extend, v.line_up_extend, v.line_down_extend},
-	M = {},
-	L = {v.line_end, M.screen_bottom_extend, v.line_down_extend, v.line_down_extend, v.line_up_extend},
-	G = {},
-	['0'] = {},
-	['('] = {},
-	[')'] = {},
-	['{'] = {},
-	['}'] = {},
-	['^'] = {},
-	['+'] = {},
-	['|'] = {},
-	['-'] = {},
-	['$'] = {},
-	['%'] = {},
-	['_'] = {v.home, v.line_down_extend},
+	h = {reg=c, before=b, M.char_left_extend_not_line},
+	['ctrl+h'] = {reg=c, before=b, M.char_left_extend_not_line},
+	j = {reg=l, before=b, v.home, v.line_down_extend, after = v.end_extend},
+	['ctrl+n'] = {reg=l, before=b, v.home, v.line_down_extend, after = v.end_extend},
+	['\n'] = {reg=l, before=b, v.home, v.line_down_extend, after = v.end_extend},
+	k = {reg=l, before=b, v.line_end, v.home_extend, v.line_up_extend},
+	['ctrl+p'] = {reg=l, before=b, v.line_end, v.home_extend, v.line_up_extend},
+	l = {reg=c, before=b, M.char_right_extend_not_line},
+	[' '] = {reg=c, before=b, M.char_right_extend_not_line},
+	w = {reg=c, before=be, v.word_right},
+	W = {reg=c, before=be, M.bigword_right},
+	b = {reg=c, before=be, v.word_left},
+	B = {reg=c, before=be, M.bigword_left_extend},
+	e = {reg=c, before=be, v.char_right, v.word_right_end, after = v.char_left},
+	E = {reg=c, before=be, M.bigword_right_end_extend},
+--	H = {v.home, v.line_down, M.screen_top_extend, v.line_up_extend, v.line_down_extend},
+--	M = {},
+--	L = {v.line_end, M.screen_bottom_extend, v.line_down_extend, v.line_down_extend, v.line_up_extend},
+--	G = {},
+--	['0'] = {},
+--	['('] = {},
+--	[')'] = {},
+--	['{'] = {},
+--	['}'] = {},
+--	['^'] = {},
+--	['+'] = {},
+--	['|'] = {},
+--	['-'] = {},
+--	['$'] = {},
+--	['%'] = {},
+	['_'] = {reg=l, before=b, v.home, v.line_down_extend},
 -- search motions
-	n = {},
-	N = {},
-	[','] = {},
-	[';'] = {},
-	['/'] = {},
-	['?'] = {},
+--	n = {},
+--	N = {},
+--	[','] = {},
+--	[';'] = {},
+--	['/'] = {},
+--	['?'] = {},
 -- char motions
-	f = {},
-	t = {},
-	F = {},
-	T = {},
-	["'"] = {},
-	['`'] = {},
+--	f = {},
+--	t = {},
+--	F = {},
+--	T = {},
+--	["'"] = {},
+--	['`'] = {},
 }
+-- All motions are multiplied by parent count
+for index, value in pairs(motions) do
+	if type(value.before) == 'table' then table.insert(value.before, 1, C.parent_times)
+	elseif type(value.before) == 'function' then value.before = {C.parent_times, value.before}
+	else value.before = C.parent_times
+	end
+end
 Command.motions = motions
 
 local dittos = {}
 Command.dittos = dittos
 Command.default_motion = '_'
 
---- Save off user preferences and setup view style to look
---  like a terminal, since that's what vi expects.
+--- Save off user preferences and setup view style.
+--  Make it look like a terminal, since that's how vi
+--  is supposed to behave.
 local function save_set_view_style(viewarg)
 	local view = viewarg or _G.view
 	view._vitamin_save = {}
