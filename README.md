@@ -44,6 +44,8 @@ with user extensibility and modification in mind, in line with the Textadept eth
   
 ### Command and Motion Definition Tables
 
+**This has changed a lot and needs to be rewritten.**
+
 The command definition data structure is designed to allow the user to easily add new Scintilla
 key commands or user functions to Vitamin, while taking advantage of the vi command grammar's
 repeat and motion functionality. A definition may be as simple as `{view.char_left}`. But it
@@ -95,12 +97,14 @@ keys['alt+H'] = vitamin.Command(vitamin.commands['H']) -- execute the vi 'H' com
 
 h j k l w W b B e E H M L G 0 $ ^ + - | % _ ( ) { } [[ ]] backspace space enter
 
+x X y d p P
+
 ctrl+  
 f b d u e y h j n p
 
 ###Motions:
 
-
+h j k l w W b B e E _
 
 ## Planned Features
 

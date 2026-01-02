@@ -438,7 +438,7 @@ local commands = {
 	d = {needs = fetch.subcommand, M.get_and_clear},
 --	D = {command = 'd', motion = Motion.new('$')}, -- {buffer} d$
 	y = {needs = fetch.subcommand, before = C.restore_pos_after, v.get_sel_text},
-	q = {needs = fetch.subcommand},
+	q = {needs = fetch.subcommand}, -- debug command, TODO: remove
 --	Y = {command = 'y', motion = Motion.new('_')}, -- {buffer}{count} y_
 --	['!'] = {}, -- open command entry and run a system command
 --	['<'] = {},
