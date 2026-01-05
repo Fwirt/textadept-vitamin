@@ -111,8 +111,12 @@ function fetch.register(command, key)
 		command.reg = key
 		command.needs = fetch.count
 		return true, command
+	elseif key ~= fetch.escape_keycode then
+		error('register must be a single printable ASCII character')
+	else
+		command.needs = fetch.start
+		return true, command
 	end
-	error('register must be a single printable character')
 end
 
 function fetch.count(command, key)
@@ -135,22 +139,22 @@ function fetch.command(command, key)
 	end
 	command.status = command.status .. key
 	command.needs = nil
-	command.keycode = key
+	command.keycode = command.keycode .. key
 	command = command()
 	return true, command
 end
 
---- Get a single printable ASCII character.
+--- Get a single character.
 --  For m ` ' @ t T f F (or other commands)
 function fetch.arg(command, key)
-	if #key == 1 and match_printable(key) then -- #key implicitly filters tab
+	if utf8.len(key) == 1 then -- #key implicitly filters tab
 		command.status = command.status .. key
 		command.needs = nil
 		command.arg = key
 		command = command()
 		return true, command
 	end
-	error('arg to "'..command.keycode..'" must be a printable char', 0)
+	error('arg to "'..command.keycode..'" must be a single char', 0)
 end
 
 --- Subcommand is being specified.
@@ -161,6 +165,7 @@ end
 function fetch.subcommand(command, key)
 	command.needs = nil
 	local sub = Command(Command.motions)
+	sub.status = command.status
 	sub.parent = command
 	sub.reg = command.reg
 	sub.needs = fetch.count
@@ -184,32 +189,38 @@ function fetch.input(command, key) -- TODO: Maybe break out a second state?
 end
 
 --- Open the command entry and store the result in a register.
---  To be called by `command.before`. The register is the keycode of
---  the command.
-function fetch.prompt(command)
-	ui.command_entry.run(command.prompt, function (text)
-		command.before = nil
-		command.needs = nil
-		registers[command.reg.name or command.keycode or ''] = text
-		command = command()
-	end)
-	command.needs = fetch.prompt_wait
-	return Command.default_before(command)
+--  To be called from `command.before`. If the user runs the prompt,
+--  the text entered will be stored in both the `command.prompt_result`
+--  field and the specified register, or the 'prompt' register if none
+--  is specified.
+function fetch.prompt(command, reg)
+	if not command.prompt_result then
+		ui.command_entry.run(command.prompt, function (text)
+			command.needs = nil
+			registers[reg or 'prompt'] = text
+			command.prompt_result = text
+			command = command()
+		end)
+		command.needs = fetch.prompt_wait
+		return nil, command
+	else return true, command end
 end
 
 --- Do nothing until the command entry closes.
---  The keypress handler really shouldn't be able to trigger while
---  the command entry is open. But just in case it does, it should
+--  When the keypress handler fires and the command entry is open, it should
 --  block while we wait for command input. If the user cancels the
---  command entry or it loses focus, then the prompt function will
---  never fire and the state machine will get stuck so just run the
---  command. Commands should be able to handle nil text input.
+--  command entry then the prompt function will never fire, and we should
+--  cancel the command. The command entry always emits an 'esc' keycode when
+--  it is closed, whether or not the user cancelled it, and this handler will
+--  consume it. If the user pressed enter, the command function should fire before
+--  the keypress handler is invoked again. Otherwise this handler will cancel the
+--  command by setting `command.needs` to `fetch.start`
 function fetch.prompt_wait(command, key)
 	if ui.command_entry.active then
 		return nil, command
 	else
-		command.needs = nil
-		command = command()
+		command.needs = fetch.start 
+		command.prompt_result = nil
 		return true, command
 	end
 end
@@ -222,10 +233,6 @@ local safe_handle_keypress
 local function handle_keypress(key)
 	--ui.print_silent_to('debug', 'before..'..tostring(current_command)..' '..tostring(current_command and current_command.needs))
 	if ui.command_entry.active then return nil end -- prevent command entry/find dialog blocking
-	if key == fetch.escape_keycode then
-		current_command = Command() -- cancel chain
-		return nil
-	end
 	if key == fetch.exit_keycode then
 		events.emit(fetch.DISCONNECT)
 		--events.disconnect(events.KEYPRESS, handle_keypress)
@@ -245,7 +252,7 @@ local function handle_keypress(key)
 	end
 end
 
---- Prevent a key handler errors from locking up Textadept
+--- Prevent key handler errors from locking up Textadept
 safe_handle_keypress = function (key)
 	local success, result = pcall(handle_keypress, key)
 	if not success then

@@ -118,27 +118,6 @@ Command.extend = function (command)
 	return Command.default_before(command)
 end
 
---- Allows the command and motion tables to contain longer keycodes.
---  Append the arg to the keycode which will update the command def.
---  Then re-run the command field replacement. Since this gets called
---  from `command.before` then return the new value of command.before if
---  needed, or exit early so new needs can be handled.
-Command.multikey = function (newdef)
-	return function(command)
-		if not command.arg then error('command "'..command.keycode..'" requires a second key', 0) end
-		command.def = newdef
-		command.keycode = command.keycode .. command.arg
-		-- re-initialize public command fields
-		command.before = nil -- prevent circular calls
-		for key, field in pairs(command) do command[key] = nil end
-		-- write in new definition
-		for key, field in pairs(command.def) do command[key] = field end
-		command.def = {}
-		-- pretend we just copied the first def, we may need to process an arg
-		if not command.needs then return command.before(command) end
-	end
-end
-
 --- Returns the command register contents as text to be used by view methods.
 --  To be assigned to `command.before`. Also returns `reg.mode` for use by p.
 Command.get_reg = function (command)
@@ -173,8 +152,9 @@ local function ensure_string(s) return type(s) == 'string' and s or '' end
 local function call(command, subcommand)
 	-- insert and override values from definition
 	-- do before `before` so `before` can override
+	local clear = not command.def.def
 	for key, field in pairs(command.def) do command[key] = field end
-	command.def = {} -- clear so we don't overwrite subsequent calls
+	if clear then command.def = {} end -- prevent loops
 	if command.sub then -- if a command definition contains a subcommand
 		command.sub.parent = command
 		command.sub.reg = command.reg
@@ -201,7 +181,7 @@ local function call(command, subcommand)
 		end
 	end
 	-- execute "after" function(s)
-	local r = {FuncTable(command.after)(args)}
+	local r = {FuncTable(command.after)(table.unpack(args))}
 	for _, s in ipairs(r) do results = results .. ensure_string(s) end
 	-- set the register(s) to the command results, if any
 	if #results > 0 then
@@ -209,7 +189,9 @@ local function call(command, subcommand)
 		registers[''].text = results -- always set the unnamed register
 	end
 	command.needs = nil
-	return command.parent and command.parent(command) or command
+	if command.parent then return command.parent(command)
+	else view:end_undo_action() ; return command
+	end
 end
 
 --- Command object constructor.
@@ -222,15 +204,13 @@ function Command.new(def)
 	local register = registers['']
 	-- Prevent parent definition table from being modified
 	local def_meta = {
-		__index = function (self, index)
-			return def[index]
-		end,
+		__index = function (self, index) return def[index] end, -- needs to be a function for when def changes
 		__newindex = function () error('def fields are read-only', 2) end,
 		__pairs = function (t) return pairs(def) end,
 	}
 	local shadow_def = setmetatable({}, def_meta)
 	local status = ''
-	local keycode = nil
+	local keycode = ''
 	
 	local command = setmetatable({}, {
 		__call = function (self, ...)

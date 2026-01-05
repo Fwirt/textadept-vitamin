@@ -20,8 +20,6 @@
 --   	(ctrl+d, ctrl+h, ctrl+j, ctrl+m, ctrl+u, ctrl+w)
 
 -- TODO:
--- +regex search and char find should store last search in registers, for
--- search use a custom field on the register table to store last position.
 -- +Implement all the stubbed and commented out functions
 -- +Merge motions and commands table into one (just make motion keycodes be
 -- multikeys with some untypeable character at the front like \0)
@@ -50,6 +48,12 @@ local sect_regex = '^(\012|\\{|\\.(%s))'
 local para_regex = '^($|\012|\\{|\\.(%s))'
 -- for vi compatibility this should actually have 2 spaces after the sentence.
 local sent_regex = '[\\.\\!\\?][\\)\\]\\"\\\']*( |$)'
+
+--- The register that stores the previous search regex
+M.search_register = '/'
+
+--- The register that stores the previous find character
+M.find_register = ';'
 
 -- the keycode to exit Vitamin mode
 M.exit_mode_keycode = 'ctrl+esc'
@@ -117,25 +121,78 @@ end
 --  Start from view.current_pos +/- offset, end at specified
 --  location.
 local function regex_search(regex, start_offset, target_end)
-	view.search_flags = view.FIND_REGEXP | view.FIND_CXX11REGEX
-	view.target_start = view.current_pos + start_offset
+	view.search_flags = view.FIND_MATCHCASE | view.FIND_REGEXP | view.FIND_CXX11REGEX
+	view.target_start = view.current_pos + (start_offset or 1)
 	view.target_end = target_end or view.length
 	return view:search_in_target(regex)
 end
 
-M.search_forward = function (command)
-	if command.text ~= nil then
-		if regex_search(command.text, 0) >= 0 then view:goto_pos(view.target_start)
-		else command.status = 'No match found for "'..command.text..'"'
-		end
-	end
+--- Perform a vi search or find operation.
+--  This function uses some extra fields stored on the register table to determine
+--  additional search parameters. `registers[reg].search_start` optionally begins the
+--  search from the specified position. `registers[reg].find_offset` optionally indicates
+--  that the cursor is offset the specified position from where the search should start.
+--  @param view view to search in.
+--  @param reg register name that contains the search/find regular expression.
+--  @param prev if true, search in the opposite direction of the previous search.
+M.search_find = function (view, reg, prev)
+	local reg = registers[reg]
+	local regex = reg.text
+	if regex ~= '' then
+		local ts, te
+		local back = reg.back
+		back = (back and not prev) or (prev and not back)
+		if back then te = 0 end
+		if reg.search_start then ts = reg.search_start - view.current_pos
+		else ts = 0 end
+		if reg.find_offset then ts = ts + reg.find_offset * (prev and 1 or -1) end
+		ts = ts + (back and -1 or 1) -- start search offset
+		if regex_search(regex, ts, te) >= 0 then view:goto_pos(view.target_start)
+		else error('No match found for "'..regex..'"', 0) end
+	else error('No search/find specified', 0) end
 end
-M.search_backward = function (command)
-	if command.text ~= nil then
-		if regex_search(command.text, 0, 0) >= 0 then view:goto_pos(view.target_start)
-		else command.status = 'No match found for "'..command.text..'"'
+
+M.search_prompt = function (command)
+	if fetch.prompt(command) then
+		if not command.prompt_result then
+			command.needs = fetch.start
+			command.status = ''
+			return
+		elseif command.prompt_result ~= '' then
+			registers[M.search_register].text = command.prompt_result
 		end
+		registers[M.search_register].back = command.back
 	end
+	return Command.default_before(command)
+end
+M.search = function (view, prev)
+	M.search_find(view, M.search_register, prev)
+	registers[M.search_register].search_start = view.current_pos
+end
+M.search_prev = function (view)
+	M.search(view, true)
+end
+
+M.find_arg = function (command)
+	if type(command.arg) ~= 'string' and utf.len(command.arg) ~= 1 then
+		error('Invalid character for find command', 0)
+	end
+	local char = '['..string.gsub(command.arg, '[%[%]%^]', '\\%0')..']'
+	-- transform command.arg into a regex
+	-- or just use Scintilla literal search??
+	-- store it in ;
+	registers[M.find_register] = char
+	registers[M.find_register].back = command.back
+	registers[M.find_register].find_offset = command.offset or 0
+end
+M.find = function (view, prev)
+	M.search_find(view, ';', prev)
+	local move = registers[';'].find_offset or 0
+	if prev then move = move * -1 end
+	view.goto_pos(view.current_pos + move)
+end
+M.find_prev = function (view)
+	M.find(view, true)
 end
 
 --- Move by bigword /[\s\t\n]+.*[\s\t\n]/.
@@ -254,10 +311,7 @@ end
 
 -- move to next brace position and match
 function M.brace_right_match(view) -- %
-	view.search_flags = view.FIND_REGEXP
-	view.target_start = view.current_pos
-	view.target_end = view.length
-	view:goto_pos(view:brace_match(view:search_in_target('[\\(\\[\\{\\)\\]\\}]'), 0))
+	view:goto_pos(view:brace_match(regex_search('[\\(\\[\\{\\)\\]\\}]'), 0))
 end
 
 -- scroll keeping the cursor at the same location on screen
@@ -323,6 +377,15 @@ end
 function M.move_P(view, text, mode)
 	if mode == 'line' then view:line_up() view:line_end() end
 end
+--- Extend by count but throw an error if line end is hit, for r
+function M.extend_r(command)
+	local line_end = view.line_end_position[view:line_from_position(view.current_pos)]
+	local end_pos = view.current_pos + (command.count or 1)
+	if end_pos > line_end then error('too few characters to replace.', 0)
+	else view.current_pos = end_pos end
+	dp(Command.default_before(command))
+	return Command.default_before(command)
+end
 
 function M.clear_selection(view)
 	view.set_empty_selection(view, view.current_pos)
@@ -382,9 +445,10 @@ local commands = {
 	[')'] = {M.sentence_next},
 	['{'] = {M.paragraph_last},
 	['}'] = {M.paragraph_next},
-	-- see below for multikey definitions
-	['[['] = {M.section_last},
-	[']]'] = {M.section_next},
+	['['] = {needs = fetch.command, def = {
+		['[['] = {M.section_last}}},
+	[']'] = {needs = fetch.command, def = {
+		[']]'] = {M.section_next}}},
 	['ctrl+f'] = {v.page_down, after = M.screen_top},
 	['ctrl+b'] = {v.page_up, after = M.screen_bottom},
 	['ctrl+d'] = {M.half_page_down},
@@ -400,19 +464,20 @@ local commands = {
 	['pgup'] = {v.page_up},
 	['pgdn'] = {v.page_down},
 -- search
---	[';'] = {M.repeat_find},
---	[','] = {M.reverse_find},
-	['/'] = {reg = {name = '/'}, before = {M.pre_search, fetch.prompt}, M.search_next},
-	['?'] = {reg = {name = '?'}, before = {M.pre_search, fetch.prompt}, M.search_prev},
-	n = {M.search_next, count = 1},
+	[';'] = {M.find},
+	[','] = {M.find_prev},
+	['/'] = {before = M.search_prompt, M.search},
+	['?'] = {before = M.search_prompt, M.search, back = true},
+	n = {M.search, count = 1},
 	N = {M.search_prev, count = 1},
 -- editor
 	u = {v.undo},
+	U = {v.redo},
 --	['.'] = {M.repeat_edit},
 --	[':'] = {M.ex_command, 0},
 --	['&'] = {M.nop} -- repeat last ex s command
---	['ctrl+g'] = {before = M.display_info},
---	['ctrl+^'] = {ui.switch_buffer, M.nop},
+	['ctrl+g'] = {before = M.display_info},
+--	['ctrl+^'] = {ui.switch_buffer},
 -- editing
 --	J = {textadept.editing.join_lines},
 --	['~'] = {M.reverse_case},
@@ -428,21 +493,19 @@ local commands = {
 --	["'"] = {return_to_mark, vc_home, 0, needs = fetch.arg},
 --	['`'] = {return_to_mark, 0, needs = fetch.arg},
 -- char commands
---	f = {needs = fetch.arg},
---	F = {needs = fetch.arg},
---	t = {needs = fetch.arg},
---	T = {needs = fetch.arg},
---	r = {needs = fetch.arg},
---	['@'] = {eval_buffer, needs = needs.char}, -- run the contents of a buffer as if it was typed
+	f = {needs = fetch.arg, before = M.find_arg, M.find},
+	F = {needs = fetch.arg, before = M.find_arg, back = true, M.find},
+	t = {needs = fetch.arg, before = M.find_arg, offset = -1, M.find},
+	T = {needs = fetch.arg, before = M.find_arg, back = true, offset = -1, M.find},
+	r = {needs = fetch.arg, before = M.extend_r, v.clear, v.add_text},
+--	['@'] = {needs = fetch.arg, M.eval_buffer}, -- run the contents of a buffer as if it was typed
 -- motion commands
 	d = {needs = fetch.subcommand, M.get_and_clear},
---	D = {command = 'd', motion = Motion.new('$')}, -- {buffer} d$
 	y = {needs = fetch.subcommand, before = C.restore_pos_after, v.get_sel_text},
-	q = {needs = fetch.subcommand}, -- debug command, TODO: remove
---	Y = {command = 'y', motion = Motion.new('_')}, -- {buffer}{count} y_
+--	q = {needs = fetch.subcommand}, -- debug command, TODO: remove
 --	['!'] = {}, -- open command entry and run a system command
---	['<'] = {},
---	['>'] = {},
+	['>'] = {needs = fetch.subcommand, v.line_indent},
+	['<'] = {needs = fetch.subcommand, v.line_dedent},
 -- motion, buffer, and mode change
 	c = {sub = Command{needs = fetch.subcommand, M.get_and_clear}, needs = fetch.input},
 --	C = {command = 'c', motion = Motion.new('$')}, -- {buffer}{count} c$
@@ -456,15 +519,12 @@ local commands = {
 --	O = {needs = fetch.input},
 --	R = {needs = fetch.input},
 }
--- circular references won't work until the table is populated
-commands['['] = {needs = fetch.arg, before = Command.multikey(commands)}
-commands[']'] = {needs = fetch.arg, before = Command.multikey(commands)}
 Command.commands = commands
-
 -- Shortcuts to make motion definition simpler
 local l = {mode = 'line'}
 local c = {mode = 'char'}
 local b = {C.parent_times, C.save_pos}
+local bd = {C.parent_times, C.save_pos, M.dec_count}
 local be = {C.parent_times, C.save_pos, C.extend}
 
 -- Valid motions for ! < > c d y
@@ -501,7 +561,7 @@ local motions = {
 --	['+'] = {},
 --	['|'] = {},
 --	['-'] = {},
---	['$'] = {},
+	['$'] = {reg=c, before=bd, v.line_down_extend, after = v.line_end_extend},
 --	['%'] = {},
 	['_'] = {reg=l, before=b, v.home, v.line_down_extend},
 -- search motions
@@ -519,14 +579,10 @@ local motions = {
 --	["'"] = {},
 --	['`'] = {},
 }
--- All motions are multiplied by parent count
-for index, value in pairs(motions) do
-	if type(value.before) == 'table' then table.insert(value.before, 1, C.parent_times)
-	elseif type(value.before) == 'function' then value.before = {C.parent_times, value.before}
-	else value.before = C.parent_times
-	end
-end
 Command.motions = motions
+
+--commands['D'] = {sub = Command(motions['$']), M.get_and_clear}
+--commands['Y'] = {before = C.restore_pos_after, v.get_sel_text, sub = Command(motions['_'])} -- {buffer}{count} y_
 
 local dittos = {}
 Command.dittos = dittos
