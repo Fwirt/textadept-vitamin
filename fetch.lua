@@ -29,6 +29,9 @@ fetch.escape_keycode = 'esc'
 --- The keycode to exit the state machine
 fetch.exit_keycode = 'ctrl+esc'
 
+--- The keycode to signal register entry. vi standard specifies ".
+fetch.reg_keycode = '"'
+
 fetch.CONNECT = 'vitamin_entered'
 fetch.DISCONNECT = 'vitamin_exited'
 
@@ -90,10 +93,10 @@ local function match_printable(char)
 end
 
 function fetch.start(command, key)
-	command = Command(Command.commands)
+	command = Command(Command.commands)	
 	input_command = nil
 	if #key == 1 then
-		if key == '"' then
+		if key == fetch.reg_keycode then
 			command.status = command.status .. key
 			command.needs = fetch.register
 			return true, command

@@ -95,7 +95,13 @@ keys['alt+H'] = vitamin.Command(vitamin.commands['H']) -- execute the vi 'H' com
 
 ###Commands:
 
+In no particular order:
+
 h j k l w W b B e E H M L G 0 $ ^ + - | % _ ( ) { } [[ ]] backspace space enter
+
+i (partially)
+
+f F t T ; , / ? n N
 
 x X y d p P
 
@@ -109,14 +115,10 @@ h j k l w W b B e E _
 ## Planned Features
 
 Any vi standard features not listed above, including
-- input mode
-- search
 - ex commands
 - ctags
-- line undo
+- line undo (U command)
 - a, A should prevent text deletion (optionally)
-And maybe some Vim features like
-- special registers
 
 ## Incompatibilities with POSIX vi that I do not plan to fix
 

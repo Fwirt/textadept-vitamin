@@ -4,7 +4,6 @@
 
 FuncTable = {}
 
--- This is returning nil for some reason.
 local function ft_call(self, ...)
 	local rt = {}
 	local r
